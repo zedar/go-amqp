@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/go-amqp/internal/testconn"
+	"github.com/princjef/go-amqp/internal/testconn"
 )
 
 // Known good challenges/responses taken following specification:

@@ -6,7 +6,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/Azure/go-amqp"
+	"github.com/princjef/go-amqp"
 )
 
 // Tests that require a local broker running on the standard AMQP port.
