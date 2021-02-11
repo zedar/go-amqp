@@ -1386,7 +1386,12 @@ func (l *link) muxHandleFrame(fr frameBody) error {
 
 		// Unblock receivers waiting for message disposition
 		if l.receiver != nil {
-			l.receiver.inFlight.remove(fr.First, fr.Last, nil)
+			// bubble disposition error up to the receiver
+			var dispositionError error
+			if state, ok := fr.State.(*stateRejected); ok {
+				dispositionError = state.Error
+			}
+			l.receiver.inFlight.remove(fr.First, fr.Last, dispositionError)
 		}
 
 		// If sending async and a message is rejected, cause a link error.
