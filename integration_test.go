@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,7 +22,13 @@ import (
 
 	"github.com/Azure/go-amqp"
 	"github.com/Azure/go-amqp/internal/testconn"
+	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/go-autorest/autorest/adal"
+	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/fortytw2/leaktest"
+
+	"github.com/Azure/azure-sdk-for-go/services/eventhub/mgmt/2017-04-01/eventhub"
+	"github.com/Azure/azure-sdk-for-go/services/servicebus/mgmt/2017-04-01/servicebus"
 )
 
 func init() {
@@ -30,18 +37,18 @@ func init() {
 }
 
 var (
-	isForkPR = os.Getenv("CI") != "" && os.Getenv("SERVICEBUS_ACCESS_KEY") == ""
-	/*subscriptionID = mustGetenv("AZURE_SUBSCRIPTION_ID")
-	resourceGroup  = mustGetenv("AZURE_RESOURCE_GROUP")
-	tenantID       = mustGetenv("AZURE_TENANT_ID")
-	clientID       = mustGetenv("AZURE_CLIENT_ID")
-	clientSecret   = mustGetenv("AZURE_CLIENT_SECRET")
+	isForkPR        = os.Getenv("CI") != "" && os.Getenv("SERVICEBUS_ACCESS_KEY") == ""
+	subscriptionID  = mustGetenv("AZURE_SUBSCRIPTION_ID")
+	resourceGroup   = mustGetenv("AZURE_RESOURCE_GROUP")
+	tenantID        = mustGetenv("AZURE_TENANT_ID")
+	clientID        = mustGetenv("AZURE_CLIENT_ID")
+	clientSecret    = mustGetenv("AZURE_CLIENT_SECRET")
 	namespace       = mustGetenv("SERVICEBUS_NAMESPACE")
 	accessKeyName   = mustGetenv("SERVICEBUS_ACCESS_KEY_NAME")
 	accessKey       = mustGetenv("SERVICEBUS_ACCESS_KEY")
 	ehNamespace     = mustGetenv("EVENTHUB_NAMESPACE")
 	ehAccessKeyName = mustGetenv("EVENTHUB_ACCESS_KEY_NAME")
-	ehAccessKey     = mustGetenv("EVENTHUB_ACCESS_KEY")*/
+	ehAccessKey     = mustGetenv("EVENTHUB_ACCESS_KEY")
 
 	tlsKeyLog = flag.String("tlskeylog", "", "path to write the TLS key log")
 	recordDir = flag.String("recorddir", "", "directory to write connection records to")
@@ -118,16 +125,25 @@ func TestIntegrationRoundTrip(t *testing.T) {
 				var sendErr error
 				go func() {
 					defer wg.Done()
-					defer testClose(t, sender.Close)
-
-					for i, data := range tt.data {
-						ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-						err = sender.Send(ctx, amqp.NewMessage([]byte(data)))
-						cancel()
-						if err != nil {
-							sendErr = fmt.Errorf("Error after %d sends: %+v", i, err)
-							return
-						}
+					maxConcurrentSend := 20
+					sendToken := make(chan struct{}, maxConcurrentSend)
+					for i, d := range tt.data {
+						sendToken <- struct{}{}
+						go func(index int, data string) {
+							defer func() { <-sendToken }()
+							ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+							msg := amqp.NewMessage([]byte(data))
+							msg.ApplicationProperties = make(map[string]interface{})
+							msg.ApplicationProperties["i"] = index
+							err = sender.Send(ctx, msg)
+							fmt.Println("sending msg ", index, " with data ", data, "to ", sender.Address())
+							cancel()
+							if err != nil {
+								sendErr = fmt.Errorf("Error after %d sends: %+v", index, err)
+								fmt.Println(sendErr)
+								return
+							}
+						}(i, d)
 					}
 				}()
 
@@ -146,7 +162,7 @@ func TestIntegrationRoundTrip(t *testing.T) {
 					}
 					defer testClose(t, receiver.Close)
 
-					for i, data := range tt.data {
+					for i := 0; i < len(tt.data); i++ {
 						ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 						msg, err := receiver.Receive(ctx)
 						cancel()
@@ -169,15 +185,22 @@ func TestIntegrationRoundTrip(t *testing.T) {
 						time.Sleep(10 * time.Millisecond)
 
 						// Accept message
-						msg.Accept()
-
-						if !bytes.Equal([]byte(data), msg.GetData()) {
-							receiveErr = fmt.Errorf("Expected received message %d to be %v, but it was %v", i+1, string(data), string(msg.GetData()))
+						msg.Accept(context.TODO())
+						msgIndex, ok := msg.ApplicationProperties["i"].(int64)
+						if !ok {
+							receiveErr = fmt.Errorf("failed to parse i. %s", msg.ApplicationProperties["i"])
+							return
+						}
+						expectedData := tt.data[msgIndex]
+						if !bytes.Equal([]byte(expectedData), msg.GetData()) {
+							receiveErr = fmt.Errorf("Expected received message %d to be %v, but it was %v", msgIndex, expectedData, string(msg.GetData()))
+							return
 						}
 					}
 				}()
 
 				wg.Wait()
+				sender.Close(context.Background())
 
 				if sendErr != nil || receiveErr != nil {
 					t.Error("Send error:", sendErr)
@@ -186,8 +209,7 @@ func TestIntegrationRoundTrip(t *testing.T) {
 			}
 
 			client.Close() // close before leak check
-
-			checkLeaks() // this is done here because queuesClient starts additional goroutines
+			checkLeaks()   // this is done here because queuesClient starts additional goroutines
 
 			// Wait for Azure to update stats
 			time.Sleep(1 * time.Second)
@@ -401,7 +423,7 @@ func TestIntegrationReceiverModeSecond(t *testing.T) {
 						}
 
 						// Accept message
-						err = msg.Accept()
+						err = msg.Accept(context.TODO())
 						if err != nil {
 							receiveErr = fmt.Errorf("Error accepting message: %+v", err)
 							return
@@ -543,20 +565,11 @@ func TestIntegrationSend_Concurrent(t *testing.T) {
 		data  []string
 	}{
 		{
-			label: "3 send, small payload",
-			data: []string{
-				"2Hey there!",
-				"2Hi there!",
-				"2Ho there!",
-			},
-		},
-		{
-			label: "3 roundtrip, medium payload",
-			data: []string{
+			label: "200 roundtrip, medium payload",
+			data: repeatStrings(200,
 				strings.Repeat("A", 10000),
 				strings.Repeat("B", 10000),
-				strings.Repeat("C", 10000),
-			},
+				strings.Repeat("C", 10000)),
 		},
 	}
 
@@ -591,7 +604,8 @@ func TestIntegrationSend_Concurrent(t *testing.T) {
 					defer wg.Done()
 
 					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					err := sender.Send(ctx, amqp.NewMessage([]byte(data)))
+					msg := amqp.NewMessage([]byte(data))
+					err := sender.Send(ctx, msg)
 					cancel()
 					if err != nil {
 						t.Fatalf("Error on send %d: %+v", i, err)
@@ -601,6 +615,9 @@ func TestIntegrationSend_Concurrent(t *testing.T) {
 			}
 			wg.Wait()
 
+			for i := 0; i < len(tt.data); i++ {
+
+			}
 			testClose(t, sender.Close)
 			client.Close() // close before leak check
 
@@ -1264,7 +1281,7 @@ func newClient(t testing.TB, label, ns, username, password string, opts ...amqp.
 	return client
 }
 
-/*func newTestQueue(t testing.TB, suffix string) (string, servicebus.QueuesClient, func()) {
+func newTestQueue(t testing.TB, suffix string, options ...func(prop *servicebus.SBQueueProperties)) (string, servicebus.QueuesClient, func()) {
 	t.Helper()
 	shouldRunIntegration(t)
 
@@ -1283,7 +1300,12 @@ func newClient(t testing.TB, label, ns, username, password string, opts ...amqp.
 	queuesClient := servicebus.NewQueuesClient(subscriptionID)
 	queuesClient.Authorizer = autorest.NewBearerAuthorizer(token)
 
-	params := servicebus.SBQueue{}
+	params := servicebus.SBQueue{
+		SBQueueProperties: &servicebus.SBQueueProperties{},
+	}
+	for _, option := range options {
+		option(params.SBQueueProperties)
+	}
 	_, err = queuesClient.CreateOrUpdate(context.Background(), resourceGroup, namespace, queueName, params)
 	if err != nil {
 		t.Fatal(err)
@@ -1337,7 +1359,7 @@ func newTestHub(t testing.TB, suffix string) (string, eventhub.EventHubsClient, 
 	}
 
 	return hubName, ehClient, cleanup
-}*/
+}
 
 func ptrInt64(i int64) *int64 {
 	return &i
