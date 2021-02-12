@@ -1118,6 +1118,317 @@ func createEventHubReceivers(t testing.TB, hubName string, session *amqp.Session
 	}
 }*/
 
+func TestIntegration_PeekLockExpiry_ReturnsErrorOnAcceptFailures(t *testing.T) {
+	queueName, _, cleanup := newTestQueue(t, "receive", func(prop *servicebus.SBQueueProperties) {
+		lockDuration := "PT5S"
+		prop.LockDuration = &lockDuration
+	})
+	defer cleanup()
+
+	checkLeaks := leaktest.CheckTimeout(t, 60*time.Second)
+
+	// Create client
+	client := newSBClient(t, "dispositionFailure")
+	defer client.Close()
+
+	// Open a session
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a sender
+	sender, err := session.NewSender(
+		amqp.LinkTargetAddress(queueName),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = sender.Send(ctx, amqp.NewMessage([]byte("I'm expired!")))
+	if err != nil {
+		t.Fatalf("Error on send: %+v", err)
+		return
+	}
+
+	receiver, err := session.NewReceiver(
+		amqp.LinkSourceAddress(queueName),
+		amqp.LinkReceiverSettle(amqp.ModeSecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msg, err := receiver.Receive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("processing message ", msg.DeliveryTag)
+	time.Sleep(6 * time.Second) // more that 1 second
+
+	err = msg.Accept(ctx)
+	if err == nil {
+		t.Fatalf("This should fail with an error about lock expiry")
+	}
+
+	receiver.Close(ctx)
+	testClose(t, sender.Close)
+	client.Close() // close before leak check
+
+	checkLeaks() // this is done here because queuesClient starts additional goroutines
+}
+
+func TestIntegration_PeekLockExpiryOnBufferedMessages_ShouldFailWithReceive(t *testing.T) {
+	queueName, _, cleanup := newTestQueue(t, "receive", func(prop *servicebus.SBQueueProperties) {
+		lockDuration := "PT5S"
+		prop.LockDuration = &lockDuration
+	})
+	defer cleanup()
+
+	tests := []struct {
+		label string
+		data  []string
+	}{
+		{
+			label: "roundtrips",
+			data: []string{
+				strings.Repeat("A", 10000),
+				strings.Repeat("B", 10000),
+				strings.Repeat("C", 10000),
+				strings.Repeat("D", 10000),
+				strings.Repeat("E", 10000),
+				strings.Repeat("F", 10000),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			checkLeaks := leaktest.CheckTimeout(t, 60*time.Second)
+
+			// Create client
+			client := newSBClient(t, tt.label)
+			defer client.Close()
+
+			// Open a session
+			session, err := client.NewSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Create a sender
+			sender, err := session.NewSender(
+				amqp.LinkTargetAddress(queueName),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var wg sync.WaitGroup
+			wg.Add(len(tt.data))
+			for i, data := range tt.data {
+				go func(i int, data string) {
+					defer wg.Done()
+
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					err := sender.Send(ctx, amqp.NewMessage([]byte(data)))
+					cancel()
+					if err != nil {
+						t.Fatalf("Error on send %d: %+v", i, err)
+						return
+					}
+				}(i, data)
+			}
+			wg.Wait()
+
+			// Open a session
+			rcvSession, err := client.NewSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+			receiver, err := rcvSession.NewReceiver(
+				amqp.LinkSourceAddress(queueName),
+				amqp.LinkCredit(3),
+				amqp.LinkReceiverSettle(amqp.ModeSecond))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Listen with a linkcredit == 1 and single receiver, and see message reaching peek lock expiry
+			maxConcurrency := 3
+			sendToken := make(chan struct{}, maxConcurrency)
+			var wgReceiver sync.WaitGroup
+			wgReceiver.Add(len(tt.data))
+			var acceptErrors []error
+			for i, d := range tt.data {
+				sendToken <- struct{}{}
+				go func(index int, data string) {
+					defer func() {
+						wgReceiver.Done()
+						<-sendToken
+					}()
+					ctx := context.Background()
+					fmt.Println("calling receive ", index)
+					msg, err := receiver.Receive(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					fmt.Println("processing message ", msg.DeliveryTag)
+					time.Sleep(4 * time.Second)
+					err = msg.Accept(ctx)
+					if err != nil {
+						acceptErrors = append(acceptErrors, err)
+					}
+				}(i, d)
+			}
+			wgReceiver.Wait()
+
+			if len(acceptErrors) == 0 {
+				t.Errorf("Expecting the test to fail Accepting messages due to lock expiry")
+			} else if !strings.Contains(acceptErrors[0].Error(), "com.microsoft:message-lock-lost") {
+				t.Errorf("Expecting the test to fail Accepting messages due to Lock expiry, but failed with: %s", acceptErrors[0].Error())
+			}
+
+			testClose(t, sender.Close)
+			client.Close() // close before leak check
+
+			checkLeaks() // this is done here because queuesClient starts additional goroutines
+		})
+	}
+}
+
+func TestIntegration_PeekLockExpiryOnBufferedMessages_ShouldPassWithHandleMessage(t *testing.T) {
+	queueName, queuesClient, cleanup := newTestQueue(t, "receive", func(prop *servicebus.SBQueueProperties) {
+		lockDuration := "PT5S"
+		prop.LockDuration = &lockDuration
+	})
+	defer cleanup()
+
+	tests := []struct {
+		label string
+		data  []string
+	}{
+		{
+			label: "roundtrips",
+			data: []string{
+				strings.Repeat("A", 10000),
+				strings.Repeat("B", 10000),
+				strings.Repeat("C", 10000),
+				strings.Repeat("D", 10000),
+				strings.Repeat("E", 10000),
+				strings.Repeat("F", 10000),
+			},
+		},
+	}
+
+	var totalMessages int
+
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			checkLeaks := leaktest.CheckTimeout(t, 60*time.Second)
+
+			// Create client
+			client := newSBClient(t, tt.label)
+			defer client.Close()
+
+			// Open a session
+			session, err := client.NewSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Create a sender
+			sender, err := session.NewSender(
+				amqp.LinkTargetAddress(queueName),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var wg sync.WaitGroup
+			wg.Add(len(tt.data))
+			for i, data := range tt.data {
+				go func(i int, data string) {
+					defer wg.Done()
+
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					err := sender.Send(ctx, amqp.NewMessage([]byte(data)))
+					cancel()
+					if err != nil {
+						t.Fatalf("Error on send %d: %+v", i, err)
+						return
+					}
+				}(i, data)
+			}
+			wg.Wait()
+
+			// Open a session
+			rcvSession, err := client.NewSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+			receiver, err := rcvSession.NewReceiver(
+				amqp.LinkSourceAddress(queueName),
+				amqp.LinkCredit(3),
+				amqp.LinkReceiverSettle(amqp.ModeSecond))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Listen with a linkcredit == 1 and single receiver, and see message reaching peek lock expiry
+			maxConcurrency := 3
+			sendToken := make(chan struct{}, maxConcurrency)
+			var wgReceiver sync.WaitGroup
+			wgReceiver.Add(len(tt.data))
+			for i, d := range tt.data {
+				sendToken <- struct{}{}
+				go func(index int, data string) {
+					defer func() {
+						wgReceiver.Done()
+						<-sendToken
+					}()
+					ctx := context.Background()
+					fmt.Println("calling receive ", index)
+					receiver.HandleMessage(ctx, func(msg *amqp.Message) error {
+						fmt.Println("processing message ", msg.DeliveryTag)
+						time.Sleep(4 * time.Second)
+						err = msg.Accept(ctx)
+						if err != nil {
+							t.Fatal(err)
+							return err
+						}
+						return nil
+					})
+				}(i, d)
+			}
+			wgReceiver.Wait()
+
+			testClose(t, sender.Close)
+			client.Close() // close before leak check
+
+			checkLeaks() // this is done here because queuesClient starts additional goroutines
+
+			// Wait for Azure to update stats
+			time.Sleep(1 * time.Second)
+
+			q, err := queuesClient.Get(context.Background(), resourceGroup, namespace, queueName)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			totalMessages += len(tt.data)
+			if amc := *q.CountDetails.ActiveMessageCount; int(amc) != 0 {
+				t.Fatalf("Expected ActiveMessageCount to be %d, but it was %d", totalMessages, amc)
+			}
+
+			if dead := *q.CountDetails.DeadLetterMessageCount; dead > 0 {
+				t.Fatalf("Expected DeadLetterMessageCount to be 0, but it was %d", dead)
+			}
+		})
+	}
+}
+
 func TestIssue48_ReceiverModeSecond(t *testing.T) {
 	azDescription := regexp.MustCompile(`The format code '0x68' at frame buffer offset '\d+' is invalid or unexpected`)
 

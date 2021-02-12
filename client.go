@@ -700,6 +700,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 
 				// if this message is received unsettled and link rcv-settle-mode == second, add to handlesByRemoteDeliveryID
 				if !body.Settled && body.DeliveryID != nil && link.receiverSettleMode != nil && *link.receiverSettleMode == ModeSecond {
+					debug(1, "TX: adding handle to handlesByRemoteDeliveryID. linkCredit: %d", link.linkCredit)
 					handlesByRemoteDeliveryID[*body.DeliveryID] = body.Handle
 				}
 
@@ -763,7 +764,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				fr.done = nil
 			}
 
-			debug(2, "TX(Session): %s", fr)
+			debug(2, "TX(Session) - txtransfer: %s", fr)
 			s.txFrame(fr, fr.done)
 
 			// "Upon sending a transfer, the sending endpoint will increment
@@ -780,13 +781,13 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				fr.IncomingWindow = s.incomingWindow
 				fr.NextOutgoingID = nextOutgoingID
 				fr.OutgoingWindow = s.outgoingWindow
-				debug(1, "TX(Session): %s", fr)
+				debug(1, "TX(Session) - tx: %s", fr)
 				s.txFrame(fr, nil)
 				remoteOutgoingWindow = s.incomingWindow
 			case *performTransfer:
 				panic("transfer frames must use txTransfer")
 			default:
-				debug(1, "TX(Session): %s", fr)
+				debug(1, "TX(Session) - default: %s", fr)
 				s.txFrame(fr, nil)
 			}
 		}
@@ -866,12 +867,14 @@ type link struct {
 	err                error // err returned on Close()
 
 	// message receiving
-	paused        uint32        // atomically accessed; indicates that all link credits have been used by sender
-	receiverReady chan struct{} // receiver sends on this when mux is paused to indicate it can handle more messages
-	messages      chan Message  // used to send completed messages to receiver
-	buf           buffer        // buffered bytes for current message
-	more          bool          // if true, buf contains a partial message
-	msg           Message       // current message being decoded
+	paused                uint32              // atomically accessed; indicates that all link credits have been used by sender
+	receiverReady         chan struct{}       // receiver sends on this when mux is paused to indicate it can handle more messages
+	messages              chan Message        // used to send completed messages to receiver
+	unsettledMessages     map[uint32]struct{} // used to keep track of messages being handled downstream
+	unsettledMessagesLock sync.RWMutex        // lock to protect concurrent access to unsettledMessages
+	buf                   buffer              // buffered bytes for current message
+	more                  bool                // if true, buf contains a partial message
+	msg                   Message             // current message being decoded
 }
 
 // attachLink is used by Receiver and Sender to create new links
@@ -1001,6 +1004,7 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 		l.deliveryCount = resp.InitialDeliveryCount
 		// buffer receiver so that link.mux doesn't block
 		l.messages = make(chan Message, l.receiver.maxCredit)
+		l.unsettledMessages = map[uint32]struct{}{}
 	} else {
 		// if dynamic address requested, copy assigned name to address
 		if l.dynamicAddr && resp.Target != nil {
@@ -1018,6 +1022,25 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 	go l.mux()
 
 	return l, nil
+}
+
+func (l *link) addUnsettled(msg *Message) {
+	l.unsettledMessagesLock.Lock()
+	l.unsettledMessages[msg.deliveryID] = struct{}{}
+	l.unsettledMessagesLock.Unlock()
+}
+
+func (l *link) deleteUnsettled(msg *Message) {
+	l.unsettledMessagesLock.Lock()
+	delete(l.unsettledMessages, msg.deliveryID)
+	l.unsettledMessagesLock.Unlock()
+}
+
+func (l *link) countUnsettled() int {
+	l.unsettledMessagesLock.RLock()
+	count := len(l.unsettledMessages)
+	l.unsettledMessagesLock.RUnlock()
+	return count
 }
 
 // setSettleModes sets the settlement modes based on the resp performAttach.
@@ -1081,10 +1104,12 @@ Loop:
 		switch {
 		// enable outgoing transfers case if sender and credits are available
 		case isSender && l.linkCredit > 0:
+			debug(1, "Link Mux isSender: credit: %d, deliveryCount: %d, messages: %d, unsettled: %d", l.linkCredit, l.deliveryCount, len(l.messages), l.countUnsettled())
 			outgoingTransfers = l.transfers
 
 		// if receiver && half maxCredits have been processed, send more credits
-		case isReceiver && l.linkCredit+uint32(len(l.messages)) <= l.receiver.maxCredit/2:
+		case isReceiver && l.linkCredit+uint32(l.countUnsettled()) <= l.receiver.maxCredit/2:
+			debug(1, "FLOW Link Mux half: source: %s, inflight: %d, credit: %d, deliveryCount: %d, messages: %d, unsettled: %d, maxCredit : %d, settleMode: %s", l.source.Address, len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), l.countUnsettled(), l.receiver.maxCredit, l.receiverSettleMode.String())
 			l.err = l.muxFlow()
 			if l.err != nil {
 				return
@@ -1092,6 +1117,7 @@ Loop:
 			atomic.StoreUint32(&l.paused, 0)
 
 		case isReceiver && l.linkCredit == 0:
+			debug(1, "PAUSE Link Mux pause: inflight: %d, credit: %d, deliveryCount: %d, messages: %d, unsettled: %d, maxCredit : %d, settleMode: %s", len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), l.countUnsettled(), l.receiver.maxCredit, l.receiverSettleMode.String())
 			atomic.StoreUint32(&l.paused, 1)
 		}
 
@@ -1115,6 +1141,8 @@ Loop:
 					if !tr.More {
 						l.deliveryCount++
 						l.linkCredit--
+						// we are the sender and we keep track of the peer's link credit
+						debug(3, "TX(link): key:%s, decremented linkCredit: %d", l.key.name, l.linkCredit)
 					}
 					continue Loop
 				case fr := <-l.rx:
@@ -1147,9 +1175,11 @@ Loop:
 func (l *link) muxFlow() error {
 	// copy because sent by pointer below; prevent race
 	var (
-		linkCredit    = l.receiver.maxCredit - uint32(len(l.messages))
+		linkCredit    = l.receiver.maxCredit - uint32(l.countUnsettled())
 		deliveryCount = l.deliveryCount
 	)
+
+	debug(3, "link.muxFlow(): len(l.messages):%d - linkCredit: %d - deliveryCount: %d, inFlight: %d", len(l.messages), l.linkCredit, deliveryCount, len(l.receiver.inFlight.m))
 
 	fr := &performFlow{
 		Handle:        &l.handle,
@@ -1264,7 +1294,9 @@ func (l *link) muxReceive(fr performTransfer) error {
 	// discard message if it's been aborted
 	if fr.Aborted {
 		l.buf.reset()
-		l.msg = Message{}
+		l.msg = Message{
+			doneSignal: make(chan struct{}),
+		}
 		l.more = false
 		return nil
 	}
@@ -1297,10 +1329,13 @@ func (l *link) muxReceive(fr performTransfer) error {
 	if err != nil {
 		return err
 	}
-
+	debug(1, "deliveryID %d before push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", l.msg.deliveryID, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
 	// send to receiver, this should never block due to buffering
 	// and flow control.
+	l.addUnsettled(&l.msg)
 	l.messages <- l.msg
+
+	debug(1, "deliveryID %d after push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", l.msg.deliveryID, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
 
 	// reset progress
 	l.buf.reset()
@@ -1309,7 +1344,7 @@ func (l *link) muxReceive(fr performTransfer) error {
 	// decrement link-credit after entire message received
 	l.deliveryCount++
 	l.linkCredit--
-
+	debug(1, "deliveryID %d before exit - deliveryCount : %d - linkCredit: %d, len(messages): %d", l.msg.deliveryID, l.deliveryCount, l.linkCredit, len(l.messages))
 	return nil
 }
 
@@ -1897,6 +1932,61 @@ type Receiver struct {
 	inFlight     inFlight                // used to track message disposition when rcv-settle-mode == second
 }
 
+// HandleMessage takes in a func to handle the incoming message.
+// Blocks until a message is received, ctx completes, or an error occurs.
+
+// Note: You must take an action on the message in the provided handler (Accept/Reject/Release/Modify)
+// or the unsettled message tracker will get out of sync, and reduce the flow.
+func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) error) error {
+	debug(3, "Entering link %s Receive()", r.link.key.name)
+
+	trackCompletion := func(msg *Message) {
+		<-msg.doneSignal
+		r.link.deleteUnsettled(msg)
+		debug(3, "Receive() deleted unsettled %d", msg.deliveryID)
+		if atomic.LoadUint32(&r.link.paused) == 1 {
+			select {
+			case r.link.receiverReady <- struct{}{}:
+				debug(3, "Receive() unpause link on completion")
+			default:
+			}
+		}
+	}
+	callHandler := func(msg *Message) error {
+		debug(3, "Receive() blocking %d", msg.deliveryID)
+		msg.receiver = r
+		if msg.doneSignal == nil {
+			msg.doneSignal = make(chan struct{})
+		}
+		go trackCompletion(msg)
+		// tracks messages until exiting handler
+		if err := handle(msg); err != nil {
+			debug(3, "Receive() blocking %d - error: %s", msg.deliveryID, err.Error())
+			return err
+		}
+		return nil
+	}
+
+	select {
+	case msg := <-r.link.messages:
+		return callHandler(&msg)
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		// pass through, to buffer msgs when the handler is busy
+	}
+
+	select {
+	case msg := <-r.link.messages:
+		return callHandler(&msg)
+	case <-r.link.done:
+		return r.link.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Deprecated: prefer HandleMessage
 // Receive returns the next message from the sender.
 //
 // Blocks until a message is received, ctx completes, or an error occurs.
@@ -1912,6 +2002,11 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 	// delivered regardless of whether the link has been closed.
 	select {
 	case msg := <-r.link.messages:
+		// we remove the message from unsettled map as soon as it's popped off the channel
+		// This makes the unsettled count the same as messages buffer count
+		// and keeps the behavior the same as before the unsettled messages tracking was introduced
+		defer r.link.deleteUnsettled(&msg)
+		debug(3, "Receive() non blocking %d", msg.deliveryID)
 		msg.receiver = r
 		return &msg, nil
 	case <-ctx.Done():
@@ -1922,6 +2017,11 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 	// wait for the next message
 	select {
 	case msg := <-r.link.messages:
+		// we remove the message from unsettled map as soon as it's popped off the channel
+		// This makes the unsettled count the same as messages buffer count
+		// and keeps the behavior the same as before the unsettled messages tracking was introduced
+		defer r.link.deleteUnsettled(&msg)
+		debug(3, "Receive() blocking %d", msg.deliveryID)
 		msg.receiver = r
 		return &msg, nil
 	case <-r.link.done:
@@ -2054,6 +2154,7 @@ func (r *Receiver) sendDisposition(first uint32, last *uint32, state interface{}
 func (r *Receiver) messageDisposition(ctx context.Context, id uint32, state interface{}) error {
 	var wait chan error
 	if r.link.receiverSettleMode != nil && *r.link.receiverSettleMode == ModeSecond {
+		debug(3, "RX: add %d to inflight", id)
 		wait = r.inFlight.add(id)
 	}
 
