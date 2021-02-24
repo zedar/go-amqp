@@ -47,7 +47,7 @@ type link struct {
 	paused                uint32              // atomically accessed; indicates that all link credits have been used by sender
 	receiverReady         chan struct{}       // receiver sends on this when mux is paused to indicate it can handle more messages
 	messages              chan Message        // used to send completed messages to receiver
-	unsettledMessages     map[uint32]struct{} // used to keep track of messages being handled downstream
+	unsettledMessages     map[string]struct{} // used to keep track of messages being handled downstream
 	unsettledMessagesLock sync.RWMutex        // lock to protect concurrent access to unsettledMessages
 	buf                   buffer              // buffered bytes for current message
 	more                  bool                // if true, buf contains a partial message
@@ -202,7 +202,7 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 		l.deliveryCount = resp.InitialDeliveryCount
 		// buffer receiver so that link.mux doesn't block
 		l.messages = make(chan Message, l.receiver.maxCredit)
-		l.unsettledMessages = map[uint32]struct{}{}
+		l.unsettledMessages = map[string]struct{}{}
 	} else {
 		// if dynamic address requested, copy assigned name to address
 		if l.dynamicAddr && resp.Target != nil {
@@ -224,13 +224,13 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 
 func (l *link) addUnsettled(msg *Message) {
 	l.unsettledMessagesLock.Lock()
-	l.unsettledMessages[msg.deliveryID] = struct{}{}
+	l.unsettledMessages[string(msg.DeliveryTag)] = struct{}{}
 	l.unsettledMessagesLock.Unlock()
 }
 
 func (l *link) deleteUnsettled(msg *Message) {
 	l.unsettledMessagesLock.Lock()
-	delete(l.unsettledMessages, msg.deliveryID)
+	delete(l.unsettledMessages, string(msg.DeliveryTag))
 	l.unsettledMessagesLock.Unlock()
 }
 
