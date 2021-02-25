@@ -24,9 +24,9 @@ type Receiver struct {
 
 // HandleMessage takes in a func to handle the incoming message.
 // Blocks until a message is received, ctx completes, or an error occurs.
-
-// Note: You must take an action on the message in the provided handler (Accept/Reject/Release/Modify)
+// When using ModeSecond, You must take an action on the message in the provided handler (Accept/Reject/Release/Modify)
 // or the unsettled message tracker will get out of sync, and reduce the flow.
+// When using ModeFirst, the message is spontaneously Accepted at reception.
 func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) error) error {
 	debug(3, "Entering link %s Receive()", r.link.key.name)
 
@@ -49,6 +49,13 @@ func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) erro
 			msg.doneSignal = make(chan struct{})
 		}
 		go trackCompletion(msg)
+		// accept spontaneously when receiver is in ModeFirst
+		// spec : http://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html#type-receiver-settle-mode
+		if r.link.receiverSettleMode.value() == ModeFirst {
+			if err := msg.Accept(ctx); err != nil {
+				return err
+			}
+		}
 		// tracks messages until exiting handler
 		if err := handle(msg); err != nil {
 			debug(3, "Receive() blocking %d - error: %s", msg.deliveryID, err.Error())
