@@ -223,6 +223,9 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 }
 
 func (l *link) addUnsettled(msg *Message) {
+	if len(msg.DeliveryTag) == 0 {
+		return
+	}
 	l.unsettledMessagesLock.Lock()
 	l.unsettledMessages[string(msg.DeliveryTag)] = struct{}{}
 	l.unsettledMessagesLock.Unlock()

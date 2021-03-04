@@ -31,6 +31,9 @@ func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) erro
 	debug(3, "Entering link %s Receive()", r.link.key.name)
 
 	trackCompletion := func(msg *Message) {
+		if msg.doneSignal == nil {
+			msg.doneSignal = make(chan struct{})
+		}
 		<-msg.doneSignal
 		r.link.deleteUnsettled(msg)
 		debug(3, "Receive() deleted unsettled %d", msg.deliveryID)
@@ -45,16 +48,10 @@ func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) erro
 	callHandler := func(msg *Message) error {
 		debug(3, "Receive() blocking %d", msg.deliveryID)
 		msg.receiver = r
-		if msg.doneSignal == nil {
-			msg.doneSignal = make(chan struct{})
-		}
-		go trackCompletion(msg)
-		// accept spontaneously when receiver is in ModeFirst
+		// we only need to track message disposition for mode second
 		// spec : http://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html#type-receiver-settle-mode
-		if r.link.receiverSettleMode.value() == ModeFirst {
-			if err := msg.Accept(ctx); err != nil {
-				return err
-			}
+		if r.link.receiverSettleMode.value() == ModeSecond {
+			go trackCompletion(msg)
 		}
 		// tracks messages until exiting handler
 		if err := handle(msg); err != nil {

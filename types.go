@@ -1674,6 +1674,7 @@ type Message struct {
 	Format uint32
 
 	// The DeliveryTag can be up to 32 octets of binary data.
+	// Note that when mode one is enabled there will be no delivery tag.
 	DeliveryTag []byte
 
 	// The header section carries standard delivery details about the transfer
@@ -1798,10 +1799,10 @@ func (m *Message) GetData() []byte {
 // Accept notifies the server that the message has been
 // accepted and does not require redelivery.
 func (m *Message) Accept(ctx context.Context) error {
-	defer m.done()
 	if !m.shouldSendDisposition() {
 		return nil
 	}
+	defer m.done()
 	return m.receiver.messageDisposition(ctx, m.deliveryID, &stateAccepted{})
 }
 
@@ -1809,20 +1810,20 @@ func (m *Message) Accept(ctx context.Context) error {
 //
 // Rejection error is optional.
 func (m *Message) Reject(ctx context.Context, e *Error) error {
-	defer m.done()
 	if !m.shouldSendDisposition() {
 		return nil
 	}
+	defer m.done()
 	return m.receiver.messageDisposition(ctx, m.deliveryID, &stateRejected{Error: e})
 }
 
 // Release releases the message back to the server. The message
 // may be redelivered to this or another consumer.
 func (m *Message) Release(ctx context.Context) error {
-	defer m.done()
 	if !m.shouldSendDisposition() {
 		return nil
 	}
+	defer m.done()
 	return m.receiver.messageDisposition(ctx, m.deliveryID, &stateReleased{})
 }
 
@@ -1839,10 +1840,10 @@ func (m *Message) Release(ctx context.Context) error {
 // with the existing message annotations, overwriting existing keys
 // if necessary.
 func (m *Message) Modify(ctx context.Context, deliveryFailed, undeliverableHere bool, messageAnnotations Annotations) error {
-	defer m.done()
 	if !m.shouldSendDisposition() {
 		return nil
 	}
+	defer m.done()
 	return m.receiver.messageDisposition(ctx,
 		m.deliveryID, &stateModified{
 			DeliveryFailed:     deliveryFailed,
@@ -1855,7 +1856,9 @@ func (m *Message) Modify(ctx context.Context, deliveryFailed, undeliverableHere 
 // without any disposition. It frees the amqp receiver to get the next message
 // this is implicitly done after calling message dispositions (Accept/Release/Reject/Modify)
 func (m *Message) Ignore() {
-	m.done()
+	if m.shouldSendDisposition() {
+		m.done()
+	}
 }
 
 // MarshalBinary encodes the message into binary form.
