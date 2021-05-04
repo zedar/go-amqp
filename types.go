@@ -1796,6 +1796,14 @@ func (m *Message) GetData() []byte {
 	return m.Data[0]
 }
 
+// GetLinkName returns associated link name or empty string if receiver or link is not defined.
+func (m *Message) GetLinkName() string {
+	if m.receiver != nil && m.receiver.link != nil {
+		return m.receiver.link.key.name
+	}
+	return ""
+}
+
 // Accept notifies the server that the message has been
 // accepted and does not require redelivery.
 func (m *Message) Accept(ctx context.Context) error {
