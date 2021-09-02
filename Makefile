@@ -20,7 +20,7 @@ test:
 	go test -v -race ./...
 
 #integration:
-	#go test -tags "integration pkgerrors" -count=1 -v -race .
+	#go test -tags "integration" -count=1 -v -race .
 
 test386:
 	TEST_CORPUS=1 go test -count=1 -v .
