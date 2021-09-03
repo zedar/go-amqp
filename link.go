@@ -153,7 +153,7 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 
 	// send Attach frame
 	debug(1, "TX: %s", attach)
-	s.txFrame(attach, nil)
+	_ = s.txFrame(attach, nil)
 
 	// wait for response
 	var fr frameBody
@@ -196,7 +196,7 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 			Closed: true,
 		}
 		debug(1, "TX: %s", fr)
-		s.txFrame(fr, nil)
+		_ = s.txFrame(fr, nil)
 
 		if detach.Error == nil {
 			return nil, fmt.Errorf("received detach with no error specified")
@@ -597,7 +597,7 @@ func (l *link) muxHandleFrame(fr frameBody) error {
 			LinkCredit:    &linkCredit, // max number of messages
 		}
 		debug(1, "TX: %s", resp)
-		l.session.txFrame(resp, nil)
+		_ = l.session.txFrame(resp, nil)
 
 	// remote side is closing links
 	case *performDetach:
@@ -643,7 +643,7 @@ func (l *link) muxHandleFrame(fr frameBody) error {
 			Settled: true,
 		}
 		debug(1, "TX: %s", resp)
-		l.session.txFrame(resp, nil)
+		_ = l.session.txFrame(resp, nil)
 
 	default:
 		debug(1, "RX: %s", fr)
