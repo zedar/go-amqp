@@ -2,6 +2,7 @@ variables:
   GOPATH: '$(system.defaultWorkingDirectory)/work'
   sdkPath: '$(GOPATH)/src/github.com/$(build.repository.name)'
   GO111MODULE: 'on'
+  AMQP_BROKER_ADDR: 'amqp://127.0.0.1:25672'
 
 jobs:
   - job: 'goamqp'
@@ -54,9 +55,29 @@ jobs:
         workingDirectory: '$(sdkPath)'
         displayName: 'Vet'
 
+      - task: UseDotNet@2
+        displayName: 'Use .NET sdk'
+        inputs:
+          packageType: sdk
+          version: 5.0.x
+          installationPath: $(Agent.ToolsDirectory)/dotnet
+
+      - script: |
+          git clone https://github.com/jhendrixMSFT/azure-amqp $(Pipeline.Workspace)/azure-amqp
+          pushd $(Pipeline.Workspace)/azure-amqp/test/TestAmqpBroker
+          dotnet restore
+          dotnet build
+          chmod +x $(Pipeline.Workspace)/azure-amqp/bin/Debug/TestAmqpBroker/net461/TestAmqpBroker.exe
+        displayName: 'Clone and Build Broker'
+
       - script: |
           set -e
+          echo '##[command]Starting broker at $(AMQP_BROKER_ADDR)'
+          $(Pipeline.Workspace)/azure-amqp/bin/Debug/TestAmqpBroker/net461/TestAmqpBroker.exe $AMQP_BROKER_ADDR /headless &
+          brokerPID=$!
+          echo '##[section]Starting tests'
           go test -tags -race -v -coverprofile=coverage.txt -covermode atomic ./... 2>&1 | go-junit-report > report.xml
+          kill $brokerPID
           gocov convert coverage.txt > coverage.json
           gocov-xml < coverage.json > coverage.xml
           gocov-html < coverage.json > coverage.html
