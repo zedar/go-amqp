@@ -14,12 +14,13 @@ type messageDisposition struct {
 
 // Receiver receives messages on a single AMQP link.
 type Receiver struct {
-	link         *link                   // underlying link
-	batching     bool                    // enable batching of message dispositions
-	batchMaxAge  time.Duration           // maximum time between the start n batch and sending the batch to the server
-	dispositions chan messageDisposition // message dispositions are sent on this channel when batching is enabled
-	maxCredit    uint32                  // maximum allowed inflight messages
-	inFlight     inFlight                // used to track message disposition when rcv-settle-mode == second
+	link           *link                   // underlying link
+	batching       bool                    // enable batching of message dispositions
+	batchMaxAge    time.Duration           // maximum time between the start n batch and sending the batch to the server
+	dispositions   chan messageDisposition // message dispositions are sent on this channel when batching is enabled
+	maxCredit      uint32                  // maximum allowed inflight messages
+	inFlight       inFlight                // used to track message disposition when rcv-settle-mode == second
+	manualCreditor *manualCreditor         // allows for credits to be managed manually (via calls to IssueCredit/DrainCredit)
 }
 
 // HandleMessage takes in a func to handle the incoming message.
@@ -78,6 +79,18 @@ func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) erro
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// IssueCredit adds credits to be requested in the next flow
+// request.
+func (r *Receiver) IssueCredit(credit uint32) error {
+	return r.link.issueCredit(credit)
+}
+
+// DrainCredit sets the drain flag on the next flow frame and
+// waits for the drain to be acknowledged.
+func (r *Receiver) DrainCredit(ctx context.Context) error {
+	return r.link.drainCredit(ctx)
 }
 
 // Receive returns the next message from the sender.
