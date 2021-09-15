@@ -9,6 +9,7 @@ import (
 
 	"github.com/Azure/go-amqp/internal/buffer"
 	"github.com/Azure/go-amqp/internal/encoding"
+	"github.com/Azure/go-amqp/internal/frames"
 )
 
 // Sender sends messages on a single AMQP link.
@@ -99,7 +100,7 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan encoding.Delivery
 		s.nextDeliveryTag++
 	}
 
-	fr := performTransfer{
+	fr := frames.PerformTransfer{
 		Handle:        s.link.handle,
 		DeliveryID:    &deliveryID,
 		DeliveryTag:   deliveryTag,
@@ -121,7 +122,7 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan encoding.Delivery
 			fr.Settled = senderSettled
 
 			// set done on last frame
-			fr.done = make(chan encoding.DeliveryState, 1)
+			fr.Done = make(chan encoding.DeliveryState, 1)
 		}
 
 		select {
@@ -138,7 +139,7 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan encoding.Delivery
 		fr.MessageFormat = nil
 	}
 
-	return fr.done, nil
+	return fr.Done, nil
 }
 
 // Address returns the link's address.
